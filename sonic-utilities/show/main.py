@@ -875,6 +875,73 @@ def get_if_oper_state(iface):
     else:
         return "down"
 
+def get_vrf_table_id(vrf_name):
+    cmd = 'ip -d link show dev {} 2>/dev/null'.format(vrf_name)
+    vrf = os.popen(cmd).read()
+    if len(vrf) <= 0:
+        return None
+    else:
+        return vrf.splitlines()[2].split()[2] + ":" + vrf.split(':')[0]
+
+#
+# 'show vrf' group command
+#
+# This group houses VRF commands and subgroups
+#
+@cli.command()
+@click.argument('vrf_name', required=False)
+def vrf(vrf_name):
+    """Show vrf commands"""
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    header = ['VRF', 'Table Id', 'Vrf Id', 'Interfaces']
+    data = []
+    vrf_dict = config_db.get_table('VRF')
+    if vrf_dict:
+        vrfs = []
+        if vrf_name is None:
+            vrfs = vrf_dict.keys()
+        elif vrf_name in vrf_dict.keys():
+            vrfs = [vrf_name]
+        for vrf in vrfs:
+            intfs = get_interface_bind_to_vrf(config_db, vrf)
+            vrf_table_id = get_vrf_table_id(vrf)
+            if vrf_table_id is None:
+                (table_id, vrf_id) = ('-', '-')
+            else:
+                (table_id, vrf_id) = (vrf_table_id.split(":")[0], vrf_table_id.split(":")[1])
+
+            if len(intfs) == 0:
+                data.append([vrf, table_id, vrf_id, ""])
+            else:
+                data.append([vrf, table_id, vrf_id, intfs[0]])
+                for intf in intfs[1:]:
+                    data.append(["", "", "", intf])
+    click.echo(tabulate(data, header))
+
+def get_interface_bind_to_vrf(config_db, vrf_name):
+    """Get interfaces belong to vrf
+    """
+    tables = ['INTERFACE', 'PORTCHANNEL_INTERFACE', 'VLAN_INTERFACE', 'LOOPBACK_INTERFACE']
+    data = []
+    for table_name in tables:
+        interface_dict = config_db.get_table(table_name)
+        if interface_dict:
+            for interface in interface_dict.keys():
+                if interface_dict[interface].has_key('vrf_name') and vrf_name == interface_dict[interface]['vrf_name']:
+                    data.append(interface)
+    return data
+
+def get_intf_master(interface_name):
+    cmd = '[ -e /sys/class/net/{}/master ] && basename $(readlink /sys/class/net/{}/master);'.format(interface_name, interface_name)
+    cmd = '{ ' + cmd + ' }'
+    vrf = os.popen(cmd).read()
+    #print("interface: {} vrf: {}".format(interface_name, vrf))
+    if len(vrf) <= 0:
+        return None
+    else:
+        return vrf
+
 
 #
 # 'show ip interfaces' command
@@ -886,13 +953,29 @@ def get_if_oper_state(iface):
 @ip.command()
 def interfaces():
     """Show interfaces IPv4 address"""
-    header = ['Interface', 'IPv4 address/mask', 'Admin/Oper']
+    header = ['Interface', 'IPv4 address/mask', 'Master', 'Admin/Oper']
     data = []
+    #Populate the ip interfaces from config DB
+    interfaces = []
+    config_db = ConfigDBConnector()
+    config_db.connect()
 
-    interfaces = natsorted(netifaces.interfaces())
+    tables = ['INTERFACE', 'VLAN_INTERFACE', 'PORTCHANNEL_INTERFACE']
+    for table in tables:
+      intfs = [k for k,v in config_db.get_table(table).iteritems() if type(k) != tuple]
+      interfaces = interfaces + intfs
+
+
+    interfaces.extend(('docker0', 'eth0', 'lo'))
 
     for iface in interfaces:
-        ipaddresses = netifaces.ifaddresses(iface)
+        try:
+            ipaddresses = netifaces.ifaddresses(iface)
+        except ValueError:
+            # There is a possible of iface list collected before the loop, may
+            # be in the process of getting deleted. Ignore such interfaces.
+            pass
+            continue
 
         if netifaces.AF_INET in ipaddresses:
             ifaddresses = []
@@ -910,7 +993,8 @@ def interfaces():
                 if get_interface_mode() == "alias":
                     iface = iface_alias_converter.name_to_alias(iface)
 
-                data.append([iface, ifaddresses[0][1], admin + "/" + oper])
+                intf_vrf = get_intf_master(iface)
+                data.append([iface, ifaddresses[0][1], intf_vrf, admin + "/" + oper])
 
             for ifaddr in ifaddresses[1:]:
                 data.append(["", ifaddr[1], ""])
@@ -923,14 +1007,14 @@ def interfaces():
 #
 
 @ip.command()
-@click.argument('ipaddress', required=False)
+@click.argument('args', metavar='[IPADDRESS] [vrf <vrf_name>] [...]', nargs=-1, required=False)
 @click.option('--verbose', is_flag=True, help="Enable verbose output")
-def route(ipaddress, verbose):
+def route(args, verbose):
     """Show IP (IPv4) routing table"""
     cmd = 'sudo vtysh -c "show ip route'
 
-    if ipaddress is not None:
-        cmd += ' {}'.format(ipaddress)
+    for arg in args:
+        cmd += " " + str(arg)
 
     cmd += '"'
 
@@ -972,6 +1056,26 @@ def ipv6():
     pass
 
 
+# This is utility funtion to get prefixlen from IPv6 Netmask string
+def ipv6_netmask_to_prefix_len( netmaskstr ):
+        """This program returns the prefix
+        length of the given IPv6 netmask"""
+
+        y = netmaskstr.lower()
+        pfxlen = 0
+        for i in range(len(y)):
+                if (y[i] == 'f'):
+                        pfxlen = pfxlen + 4
+                elif (y[i] == 'e'  or  y[i] == 'd'  or  y[i] == 'b'  or  y[i] == '7'):
+                        pfxlen = pfxlen + 3
+                elif (y[i] == 'c'  or  y[i] == 'a'  or  y[i] == '9'  or  y[i] == '6'  or  y[i] == '5'  or  y[i] == '3'):
+                        pfxlen = pfxlen + 2
+                elif (y[i] == '8'  or  y[i] == '4'  or  y[i] == '2'  or  y[i] == '1'):
+                        pfxlen = pfxlen + 1
+
+        return pfxlen
+
+
 #
 # 'show ipv6 interfaces' command
 #
@@ -982,18 +1086,24 @@ def ipv6():
 @ipv6.command()
 def interfaces():
     """Show interfaces IPv6 address"""
-    header = ['Interface', 'IPv6 address/mask', 'Admin/Oper']
+    header = ['Interface', 'IPv6 address/mask', 'Master', 'Admin/Oper']
     data = []
 
     interfaces = natsorted(netifaces.interfaces())
 
     for iface in interfaces:
-        ipaddresses = netifaces.ifaddresses(iface)
+        try:
+	    ipaddresses = netifaces.ifaddresses(iface)
+        except ValueError:
+            # There is a possible of iface list collected before the loop, may
+            # be in the process of getting deleted. Ignore such interfaces.
+            pass
+            continue
 
         if netifaces.AF_INET6 in ipaddresses:
             ifaddresses = []
             for ipaddr in ipaddresses[netifaces.AF_INET6]:
-                netmask = ipaddr['netmask'].split('/', 1)[-1]
+                netmask = ipv6_netmask_to_prefix_len(ipaddr['netmask'].split('/',1)[0])
                 ifaddresses.append(["", str(ipaddr['addr']) + "/" + str(netmask)])
 
             if len(ifaddresses) > 0:
@@ -1004,7 +1114,13 @@ def interfaces():
                     oper = "down"
                 if get_interface_mode() == "alias":
                     iface = iface_alias_converter.name_to_alias(iface)
-                data.append([iface, ifaddresses[0][1], admin + "/" + oper])
+
+                intf_vrf = get_intf_master(iface)
+                if intf_vrf is not None and intf_vrf.startswith('Vrf'):
+                    data.append([iface, ifaddresses[0][1], intf_vrf, admin + "/" + oper])
+                else:
+                    data.append([iface, ifaddresses[0][1], None, admin + "/" + oper])
+
             for ifaddr in ifaddresses[1:]:
                 data.append(["", ifaddr[1], ""])
 
@@ -1016,14 +1132,14 @@ def interfaces():
 #
 
 @ipv6.command()
-@click.argument('ipaddress', required=False)
+@click.argument('args', metavar='[IPADDRESS] [vrf <vrf_name>] [...]', nargs=-1, required=False)
 @click.option('--verbose', is_flag=True, help="Enable verbose output")
-def route(ipaddress, verbose):
+def route(args, verbose):
     """Show IPv6 routing table"""
     cmd = 'sudo vtysh -c "show ipv6 route'
 
-    if ipaddress is not None:
-        cmd += ' {}'.format(ipaddress)
+    for arg in args:
+        cmd += " " + str(arg)
 
     cmd += '"'
 
@@ -1462,7 +1578,7 @@ def brief(verbose):
 
     # Parsing VLAN Gateway info
     for key in natsorted(vlan_ip_data.keys()):
-        if len(key) == 1:
+        if not isinstance(key, tuple):
             continue
         interface_key = str(key[0].strip("Vlan"))
         interface_value = str(key[1])

@@ -9,6 +9,7 @@ import netaddr
 import re
 import syslog
 
+import ipaddress
 import sonic_device_util
 from swsssdk import ConfigDBConnector
 from swsssdk import SonicV2Connector
@@ -16,6 +17,7 @@ from minigraph import parse_device_desc_xml
 
 import aaa
 import mlnx
+import ipaddr
 
 SONIC_CFGGEN_PATH = '/usr/local/bin/sonic-cfggen'
 SYSLOG_IDENTIFIER = "config"
@@ -65,6 +67,63 @@ def run_command(command, display_cmd=False, ignore_error=False):
     if proc.returncode != 0 and not ignore_error:
         sys.exit(proc.returncode)
 
+def is_portchannel_name_valid(portchannel_name):
+    """Port Channel name validation
+    """
+    
+    if portchannel_name[:CFG_PORTCHANNEL_PREFIX_LEN] != CFG_PORTCHANNEL_PREFIX :
+        return False
+    if (portchannel_name[CFG_PORTCHANNEL_PREFIX_LEN:].isdigit() is False or 
+          int(portchannel_name[CFG_PORTCHANNEL_PREFIX_LEN:]) > CFG_PORTCHANNEL_MAX_VAL) :
+        return False
+    if len(portchannel_name) > CFG_PORTCHANNEL_NAME_TOTAL_LEN_MAX:
+        return False
+    return True
+
+def is_portchannel_present_in_db(db, portchannel_name):
+    """Check Port Channel present in Config DB
+    """
+
+    portchannel_list = db.get_table(CFG_PORTCHANNEL_PREFIX)
+    if portchannel_list is None:
+        return False
+    if portchannel_name in portchannel_list:
+        return True
+    return False
+
+def get_intf_vrf_bind(ctx, interface_name, interface_type):
+    config_db = ctx.obj["config_db"]
+    intfvrf = config_db.get_table(interface_name)
+    if len(intfvrf) == 0:
+        return ""
+    elif 'vrf_name' in intfvrf[0].keys():
+        return intfvrf[0]['vrf_name']
+    else:
+        return ""
+
+def is_subnet_configured(ctx, cfg_ip, cfg_vrf, interface_name):
+    """
+    The method checks if the subnet to be configured overlaps with 
+    any existing subnets
+    """
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    tables = ['INTERFACE', 'VLAN_INTERFACE', 'PORTCHANNEL_INTERFACE']
+    for table in tables:
+        #Allow secondary ip on same interface in overlapping nw
+        intfips = [k for k, v in config_db.get_table(table).iteritems() if type(k) == tuple and k[0] != interface_name]
+        for intfip in intfips:
+            vrf = None
+            ip = None
+            (interface_name, ip) = intfip
+            vrf = get_intf_vrf_bind(ctx, interface_name, table)
+            #Check only in the specified vrf
+            #print("%s %s %s"%(str(vrf), str(interface_name), str(ip)))
+            if cfg_vrf == vrf and ip is not None:
+                overlap = ipaddr.IPNetwork(ip).overlaps(ipaddr.IPNetwork(cfg_ip))
+                if overlap is True:
+                    return True
+    return False
 
 def interface_alias_to_name(interface_alias):
     """Return default interface name if alias name is given as argument
@@ -947,11 +1006,40 @@ def add(ctx, interface_name, ip_addr):
             ctx.fail("'interface_name' is None!")
 
     if interface_name.startswith("Ethernet"):
-        config_db.set_entry("INTERFACE", (interface_name, ip_addr), {"NULL": "NULL"})
+        interface_type = "INTERFACE"
     elif interface_name.startswith("PortChannel"):
-        config_db.set_entry("PORTCHANNEL_INTERFACE", (interface_name, ip_addr), {"NULL": "NULL"})
+        interface_type = "PORTCHANNEL_INTERFACE"
     elif interface_name.startswith("Vlan"):
-        config_db.set_entry("VLAN_INTERFACE", (interface_name, ip_addr), {"NULL": "NULL"})
+        interface_type = "VLAN_INTERFACE"
+    elif interface_name.startswith("Loopback"):
+        interface_type = "LOOPBACK_INTERFACE"
+    else:
+        ctx.fail("'interface_name' is not valid. Valid names [Ethernet/PortChannel/Vlan/Loopback]")
+
+    #Validate if member is IP interface
+    for k,v in config_db.get_table('VLAN_MEMBER'):
+        if v == interface_name:
+            print"Error: %s Interface configured as VLAN_MEMBER under vlan : %s" %(interface_name,str(k))
+            return
+
+    if (interface_name.startswith("PortChannel")) and (is_portchannel_name_valid(interface_name) is True):
+        if is_portchannel_present_in_db(config_db, interface_name) is False:
+            ctx.fail("{} is not present.".format(interface_name))
+
+    intfvrf = [v for k, v in config_db.get_table(interface_type).iteritems() if k == interface_name ]
+    if len(intfvrf) == 0:
+        config_db.set_entry(interface_type, interface_name, {"NULL": "NULL"})
+
+    intf_vrf = get_intf_vrf_bind(ctx, interface_name, interface_type)
+    #print("Interface {} is bound to vrf {}".format(str(interface_name), str(intf_vrf)))
+
+    if is_subnet_configured(ctx, ip_addr, intf_vrf, interface_name) is True:
+        ctx.fail("This IP address overlaps with a previously configured IP subnet")
+    try:
+        ipaddress.ip_network(unicode(ip_addr), strict=False)
+        config_db.set_entry(interface_type, (interface_name, ip_addr), {"NULL": "NULL"})
+    except ValueError:
+        ctx.fail("'ip_addr' is not valid.")
 
 #
 # 'del' subcommand
@@ -969,12 +1057,184 @@ def remove(ctx, interface_name, ip_addr):
         if interface_name is None:
             ctx.fail("'interface_name' is None!")
 
+    try:
+        ipaddress.ip_network(unicode(ip_addr), strict=False)
+        if_table = ""
     if interface_name.startswith("Ethernet"):
         config_db.set_entry("INTERFACE", (interface_name, ip_addr), None)
+            if_table = "INTERFACE"
     elif interface_name.startswith("PortChannel"):
         config_db.set_entry("PORTCHANNEL_INTERFACE", (interface_name, ip_addr), None)
+            if_table = "PORTCHANNEL_INTERFACE"
     elif interface_name.startswith("Vlan"):
         config_db.set_entry("VLAN_INTERFACE", (interface_name, ip_addr), None)
+            if_table = "VLAN_INTERFACE"
+        elif interface_name.startswith("Loopback"):
+            config_db.set_entry("LOOPBACK_INTERFACE", (interface_name, ip_addr), None)
+            if_table = "LOOPBACK_INTERFACE"
+        else:
+            ctx.fail("'interface_name' is not valid. Valid names [Ethernet/PortChannel/Vlan/Loopback]")
+    except ValueError:
+        ctx.fail("'ip_addr' is not valid.")
+
+    exists = False
+    if if_table:
+        interfaces = config_db.get_table(if_table)
+        for key in interfaces.keys():
+            if not isinstance(key, tuple):
+                continue
+            if interface_name in key:
+                exists = True
+                break
+
+    if not exists:
+        config_db.set_entry(if_table, interface_name, None)
+
+def del_intf_bound_to_vrf(config_db, vrf_name):
+    """del interface bind to vrf
+    """
+    tables = ['INTERFACE', 'PORTCHANNEL_INTERFACE', 'VLAN_INTERFACE', 'LOOPBACK_INTERFACE']
+    for table_name in tables:
+        interface_dict = config_db.get_table(table_name)
+        if interface_dict:
+            for interface_name in interface_dict.keys():
+                if interface_dict[interface_name].has_key('vrf_name') and vrf_name == interface_dict[interface_name]['vrf_name']:
+                    interface_dependent = interface_ipaddr_dependent_on_interface(config_db, interface_name)
+                    for interface_del in interface_dependent:
+                        config_db.set_entry(table_name, interface_del, None)
+                    config_db.set_entry(table_name, interface_name, None)
+
+#
+# 'vrf' group ('config vrf ...')
+#
+@config.group()
+@click.pass_context
+@click.option('-s', '--redis-unix-socket-path', help='unix socket path for redis connection')
+def vrf(ctx, redis_unix_socket_path):
+    """VRF-related configuration tasks"""
+    kwargs = {}
+    if redis_unix_socket_path:
+        kwargs['unix_socket_path'] = redis_unix_socket_path
+    config_db = ConfigDBConnector(**kwargs)
+    config_db.connect(wait_for_init=False)
+    ctx.obj = {'db': config_db}
+    pass
+
+@vrf.command('add')
+@click.argument('vrfname', metavar='<vrf-name>', required=True, type=str)
+@click.pass_context
+def add_vrf(ctx, vrfname):
+    db = ctx.obj['db']
+    if not vrfname.startswith('Vrf'):
+        ctx.fail("VRF name should begin with Vrf")
+    if vrfname in db.get_table('VRF').keys():
+        ctx.fail("{} already exists".format(vrfname))
+    db.set_entry('VRF', vrfname, {"fallback": "false"})
+
+@vrf.command('del')
+@click.argument('vrfname', metavar='<vrf-name>', required=True, type=str)
+@click.pass_context
+def del_vrf(ctx, vrfname):
+    db = ctx.obj['db']
+    if vrfname not in db.get_table('VRF').keys():
+        ctx.fail("vrf {} doesnt exists".format(vrfname))
+    del_intf_bound_to_vrf(db, vrfname)
+    db.set_entry('VRF', vrfname, None)
+
+
+#
+# 'interface bind to vrf' command ('config interface bind ...')
+#
+@interface.command('bind')
+@click.argument('interface_name', metavar='<interface_name>', required=True)
+@click.argument("vrfname", metavar="<vrf-name>", required=True, type=str)
+@click.pass_context
+def bind(ctx, interface_name, vrfname):
+    """Bind interface to a vrf"""
+    config_db = ctx.obj["config_db"]
+    if get_interface_naming_mode() == "alias":
+        interface_name = interface_alias_to_name(interface_name)
+        if interface_name is None:
+            ctx.fail("'interface_name' is None!")
+
+    if vrfname not in config_db.get_table('VRF').keys():
+        ctx.fail("vrf {} doesnt exists".format(vrfname))
+
+    if interface_name.startswith("Ethernet"):
+        interface_type = 'INTERFACE'
+    elif interface_name.startswith("PortChannel"):
+        interface_type = 'PORTCHANNEL_INTERFACE'
+    elif interface_name.startswith("Vlan"):
+        interface_type = 'VLAN_INTERFACE'
+    elif interface_name.startswith("Loopback"):
+        interface_type = "LOOPBACK_INTERFACE"
+
+    intfvrf = get_intf_vrf_bind(ctx, interface_name, interface_type)
+    if intfvrf is not None and len(intfvrf) > 0:
+        if intfvrf == vrfname:
+            print('Interface is already bound to same vrf')
+            return
+        else:
+            ctx.fail("Interface is bound to different vrf {}. Unbind first.".format(vrf))
+
+    ips = [ k[1] for k in config_db.get_table(interface_type) if type(k) == tuple and k[0] == interface_name ]
+    for ip in ips:
+        try:
+            ipaddress.ip_network(unicode(ip), strict=False)
+            config_db.set_entry(interface_type, (interface_name, ip), None)
+            #config_db.set_entry(interface_type, (interface_name, vrfname, ip), {"NULL": "NULL"})
+        except ValueError:
+            ctx.fail("Invalid ip {} found on interface {}".format(ip, interface_name))
+
+    config_db.set_entry(interface_type, interface_name, None)
+    config_db.set_entry(interface_type, interface_name, {"vrf_name": vrfname})
+
+#
+# 'interface unbind to vrf' command ('config interface bind ...')
+#
+@interface.command('unbind')
+@click.argument('interface_name', metavar='<interface_name>', required=True)
+@click.argument("vrfname", metavar="<vrf-name>", required=True, type=str)
+@click.pass_context
+def unbind(ctx, interface_name, vrfname):
+    """UNBind interface to a vrf"""
+    config_db = ctx.obj["config_db"]
+    if get_interface_naming_mode() == "alias":
+        interface_name = interface_alias_to_name(interface_name)
+        if interface_name is None:
+            ctx.fail("'interface_name' is None!")
+
+    if vrfname not in config_db.get_table('VRF').keys():
+        ctx.fail("vrf {} doesnt exists".format(vrfname))
+
+    ips = []
+    if interface_name.startswith("Ethernet"):
+        interface_type = 'INTERFACE'
+    elif interface_name.startswith("PortChannel"):
+        interface_type = 'PORTCHANNEL_INTERFACE'
+    elif interface_name.startswith("Vlan"):
+        interface_type = 'VLAN_INTERFACE'
+    else:
+        ctx.fail("Unknown interface type for interface {}!".format(interface_name))
+
+    intfvrf = [v for k, v in config_db.get_table(interface_type).iteritems() if k == interface_name ]
+    if len(intfvrf) == 0:
+        ctx.fail("Interface is not bound to any vrf.")
+    else:
+        if 'vrf_name' in intfvrf[0] and intfvrf[0]['vrf_name'] != vrfname:
+            ctx.fail("Interface is bound to different vrf {}".format(intfvrf[0]['vrf_name']))
+
+    ips = [ k[1] for k in config_db.get_table(interface_type) if type(k) == tuple and k[0] == interface_name ]
+    for ip in ips:
+        try:
+            ipaddress.ip_network(unicode(ip), strict=False)
+            config_db.set_entry(interface_type, (interface_name, ip), None)
+            #config_db.set_entry(interface_type, (interface_name, vrfname, ip), {"NULL": "NULL"})
+        except ValueError:
+            ctx.fail("Invalid ip {} found on interface {}".format(ip, interface_name))
+
+    config_db.set_entry(interface_type, interface_name, None)
+
 
 #
 # 'acl' group ('config acl ...')
