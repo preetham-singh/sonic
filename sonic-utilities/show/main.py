@@ -890,11 +890,15 @@ def get_vrf_table_id(vrf_name):
 #
 @cli.command()
 @click.argument('vrf_name', required=False)
-def vrf(vrf_name):
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+def vrf(vrf_name, verbose):
     """Show vrf commands"""
     config_db = ConfigDBConnector()
     config_db.connect()
-    header = ['VRF', 'Table Id', 'Vrf Id', 'Interfaces']
+    if verbose == False:
+        header = ['VRF', 'Interfaces']
+    else:
+        header = ['VRF', 'Table Id', 'Vrf Id', 'Interfaces']
     data = []
     vrf_dict = config_db.get_table('VRF')
     if vrf_dict:
@@ -905,18 +909,28 @@ def vrf(vrf_name):
             vrfs = [vrf_name]
         for vrf in vrfs:
             intfs = get_interface_bind_to_vrf(config_db, vrf)
-            vrf_table_id = get_vrf_table_id(vrf)
-            if vrf_table_id is None:
-                (table_id, vrf_id) = ('-', '-')
-            else:
-                (table_id, vrf_id) = (vrf_table_id.split(":")[0], vrf_table_id.split(":")[1])
+            if verbose == True:
+                vrf_table_id = get_vrf_table_id(vrf)
+                if vrf_table_id is None:
+                    (table_id, vrf_id) = ('-', '-')
+                else:
+                    (table_id, vrf_id) = (vrf_table_id.split(":")[0], vrf_table_id.split(":")[1])
 
             if len(intfs) == 0:
-                data.append([vrf, table_id, vrf_id, ""])
+                if verbose == True:
+                    data.append([vrf, table_id, vrf_id, ""])
+                else:
+                    data.append([vrf, ""])
             else:
-                data.append([vrf, table_id, vrf_id, intfs[0]])
+                if verbose == True:
+                    data.append([vrf, table_id, vrf_id, intfs[0]])
+                else:
+                    data.append([vrf, intfs[0]])
                 for intf in intfs[1:]:
-                    data.append(["", "", "", intf])
+                    if verbose == True:
+                        data.append(["", "", "", intf])
+                    else:
+                        data.append(["", intf])
     click.echo(tabulate(data, header))
 
 def get_interface_bind_to_vrf(config_db, vrf_name):
@@ -1093,7 +1107,7 @@ def interfaces():
 
     for iface in interfaces:
         try:
-	    ipaddresses = netifaces.ifaddresses(iface)
+            ipaddresses = netifaces.ifaddresses(iface)
         except ValueError:
             # There is a possible of iface list collected before the loop, may
             # be in the process of getting deleted. Ignore such interfaces.
