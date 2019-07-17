@@ -63,3 +63,12 @@ $ config loopback add Loopback<1-999> [<vrf_name>]
 // delete loopback:
 $ config loopback del Loopback<1-999>
 ```
+### Pull Requests
+
+```
+- CLI changes are part of PR [581](https://github.com/Azure/sonic-utilities/pull/581)
+
+- Interface template changes are part of PR [3171](https://github.com/Azure/sonic-buildimage/pull/3171)
+
+- Intfmgrd & Intfsorch changes are made on VRF changes branch of Nephos: PR [5](https://github.com/tylerlinp/sonic-swss/pull/5)
+```
