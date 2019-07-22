@@ -63,6 +63,46 @@ $ config loopback add Loopback<1-999> [<vrf_name>]
 // delete loopback:
 $ config loopback del Loopback<1-999>
 ```
+
+## User scenarios
+
+Add Loopback interface to a VRF:
+In case, user wants to configure Loopback say Loopback10 in Vrf-blue fllowing are the steps:
+```bash
+$ config loopback add Loopback10 Vrf-blue
+```
+This command does following operations:
+- Create loopback interface entry in LOOPBACK_INTERFACE in config_db and vrf binding to Vrf-blue
+- intfmgrd will create netdevice Loopback10 of type dummy and brings up the netdev.
+This will result in below sequence of netdev events in kernel from intfmgrd
+```bash
+ip link add Loopback10 type dummy
+ip link set dev Loopback10 up
+ip link set Loopback10 master Vrf-blue
+```
+- intfsorch will store this interface-vrf binding in local cache of interface information
+
+
+Add IP address on Loopback interface:
+```bash
+$ config interface ip add Loopback10 10.1.1.1/32
+```
+This command does following operations:
+In intfmgr:
+- When IP address add is received on these loopback interfaces, ip address will be applied on corresponding kernel loopback netdevice. Also add {interface_name:ip address} to app-intf-prefix-table.
+In intforch
+- When app-intf-prefix-table sees IP address add/delete for Loopback interface, vrf name is fetched from local interface cache to obtain VRF-ID and add IP2ME route with this VRF ID.
+
+
+Delete Loopback interface:
+```bash
+$ config loopback del Loopback10
+```
+When user deletes loopback interface, first all IP configured on the interface will be removed from app-intf-prefix-table
+Later interface itself will be deleted from INTERFACE table in config_db
+In intfmgrd, this will flush all ip on netdev and deletes loopback netdev in kernel
+Infrorchd will delete IP2ME routes from corresponding VRF and deletes local interface cache which holds vrf binding information.
+
 ### Pull Requests
 
 ```
